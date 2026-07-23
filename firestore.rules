@@ -1,0 +1,199 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function memberPath() {
+      return /databases/$(database)/documents/members/$(request.auth.uid);
+    }
+
+    function memberExists() {
+      return signedIn() && exists(memberPath());
+    }
+
+    function me() {
+      return get(memberPath()).data;
+    }
+
+    // ใช้สำหรับอ่านโปรไฟล์/เปลี่ยนรหัสครั้งแรกเท่านั้น
+    function enabledMember() {
+      return memberExists() && me().get('status', '') == 'active';
+    }
+
+    // Backward-compatible gate:
+    // สมาชิกเก่าบางบัญชีไม่มี field mustChangePassword/passwordChangePending
+    // จึงต้องใช้ Map.get(default) เพื่อไม่ให้ Rules โยน error และบล็อกทั้งบัญชี
+    function active() {
+      return enabledMember()
+        && me().get('mustChangePassword', false) != true
+        && me().get('passwordChangePending', false) != true;
+    }
+
+    function roleIs(value) {
+      return active() && me().get('role', 'staff') == value;
+    }
+
+    function admin() {
+      return roleIs('admin');
+    }
+
+    function manager() {
+      return roleIs('manager') || admin();
+    }
+
+    function captain() {
+      return roleIs('captain');
+    }
+
+    function manageProducts() {
+      return captain() || manager()
+        || (active() && me().get('permissions', {}).get('canManageProducts', false) == true);
+    }
+
+    function adjustStock() {
+      return captain() || manager()
+        || (active() && me().get('permissions', {}).get('canAdjustStock', false) == true);
+    }
+
+    function approver() {
+      return captain()
+        || manager()
+        || (active() && me().get('permissions', {}).get('canApprove', false) == true);
+    }
+
+    function canAssignApprovers() {
+      return captain() || manager();
+    }
+
+    match /members/{uid} {
+      // เจ้าของบัญชีต้องอ่านโปรไฟล์ตัวเองได้ แม้ยังติด First Password Gate
+      allow get: if enabledMember() && (
+        request.auth.uid == uid || captain() || manager()
+      );
+
+      allow list: if captain() || manager();
+      allow create, delete: if false;
+
+      // Admin จัดการสมาชิกได้ แต่ต้องเป็นบัญชีที่ผ่าน gate แล้ว
+      allow update: if admin();
+
+      // เจ้าของบัญชีแก้ได้เฉพาะข้อมูลส่วนตัวและสถานะ password gate ที่กำหนด
+      allow update: if enabledMember()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'firstName',
+          'lastName',
+          'displayName',
+          'position',
+          'department',
+          'phone',
+          'photoURL',
+          'profileUpdatedAt',
+          'mustChangePassword',
+          'passwordChangePending',
+          'passwordChangeStartedAt',
+          'passwordChangedAt',
+          'lastLoginAt'
+        ]);
+
+      allow update: if canAssignApprovers()
+        && resource.data.role == 'staff'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'permissions',
+          'approvalAssignedBy',
+          'approvalAssignedAt'
+        ]);
+    }
+
+    match /theviewWorkspaces/main/products/{id} {
+      allow read: if active();
+
+      // โครงสร้างสินค้าแก้ได้เฉพาะผู้มีสิทธิ์จัดการสินค้า
+      allow create, delete: if manageProducts();
+      allow update: if (manageProducts()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name','sku','skuKey','category','unit','min','archived','trashed','trashedAt','photo','photoPath','updatedAt'
+          ]))
+        || (adjustStock()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'stock','updatedAt','lastAdjustedAt','lastAdjustedBy','lastAdjustedReason'
+          ])
+          && request.resource.data.stock is number
+          && request.resource.data.stock >= 0)
+        || (approver()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'stock','updatedAt','lastAdjustedAt','lastAdjustedBy','lastAdjustedReason'
+          ])
+          && request.resource.data.stock is number
+          && request.resource.data.stock >= 0);
+    }
+
+    match /theviewWorkspaces/main/skuRegistry/{id} {
+      allow read: if active();
+      allow create, update, delete: if manageProducts();
+    }
+
+    match /theviewWorkspaces/main/approvals/{id} {
+      allow create: if admin() || (active()
+        && request.resource.data.submittedByUid == request.auth.uid
+        && request.resource.data.status == 'pending');
+
+      allow read: if approver()
+        || (active() && resource.data.submittedByUid == request.auth.uid);
+
+      allow update: if approver()
+        || (
+          active()
+          && resource.data.submittedByUid == request.auth.uid
+          && resource.data.status == 'pending'
+          && request.resource.data.submittedByUid == resource.data.submittedByUid
+          && request.resource.data.status == resource.data.status
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'qty','type','location','updatedAt','updatedByUid','updatedByName'
+          ])
+        );
+
+      allow delete: if approver()
+        || (
+          active()
+          && resource.data.submittedByUid == request.auth.uid
+          && resource.data.status == 'pending'
+        );
+    }
+
+    match /theviewWorkspaces/main/logs/{id} {
+      allow create: if active() && request.resource.data.actorUid == request.auth.uid;
+      allow read: if active();
+
+      allow update: if approver()
+        || (
+          active()
+          && resource.data.actorUid == request.auth.uid
+          && resource.data.action == 'ส่งตรวจ'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'action','detail','qty','unit','location','moveType','time','updatedAt','cancelledAt'
+          ])
+          && (
+            request.resource.data.action == 'ส่งตรวจ'
+            || request.resource.data.action == 'ยกเลิก'
+          )
+        );
+
+      allow delete: if admin();
+    }
+
+    match /theviewWorkspaces/main/auditLogs/{id} {
+      allow create: if active()
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.immutable == true;
+      allow read: if manageProducts();
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

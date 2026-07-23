@@ -1,0 +1,36 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function member() {
+      return firestore.get(/databases/(default)/documents/members/$(request.auth.uid)).data;
+    }
+    function active() {
+      return signedIn()
+        && member().get('status', '') == 'active'
+        && member().get('mustChangePassword', false) != true
+        && member().get('passwordChangePending', false) != true;
+    }
+    function canManageProducts() {
+      return active() && (
+        member().get('role', 'staff') == 'admin' ||
+        member().get('role', 'staff') == 'manager' ||
+        member().get('role', 'staff') == 'captain' ||
+        member().get('permissions', {}).get('canManageProducts', false) == true
+      );
+    }
+
+    match /product-images/{productId}/{fileName} {
+      allow read: if active();
+      allow write: if canManageProducts()
+        && request.resource != null
+        && request.resource.size < 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if canManageProducts();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
